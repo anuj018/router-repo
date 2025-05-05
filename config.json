@@ -1,0 +1,14 @@
+{
+  "shards": {
+    "shard1": {
+      "id": "shard1",
+      "host": "20.244.11.103",
+      "port": 19530,
+      "status": "active"
+    }
+  },
+  "store_mappings": {
+    "1": "shard1",
+    "2": "shard1"
+  }
+}

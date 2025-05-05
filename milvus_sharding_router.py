@@ -18,6 +18,7 @@ import random
 from typing import Dict, List, Tuple, Any, Optional, Union
 import numpy as np
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import httpx
 import redis
@@ -1102,6 +1103,13 @@ async def startup():
 async def shutdown():
     """Cleanup router on application shutdown"""
     await router.stop()
+
+@app.get("/health")
+async def health_check():
+    """
+    A simple liveness probe for your router.
+    """
+    return JSONResponse(status_code=200, content={"status": "ok"})
 
 # API Endpoints
 @app.post("/insert")
