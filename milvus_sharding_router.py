@@ -1,665 +1,3 @@
-# """
-# Corrected Milvus Router - Compatible with optimized collection schema
-
-# Fixed issues:
-# - Correct composite key calculation
-# - Proper field order matching schema
-# - Correct data types (INT32 for store_id, camera_id)
-# - Better error handling
-# """
-
-# import os
-# import json
-# import logging
-# import asyncio
-# from typing import Dict, List, Optional
-# import numpy as np
-# from fastapi import FastAPI, HTTPException
-# from fastapi.responses import JSONResponse
-# from pydantic import BaseModel
-# from pymilvus import Collection, connections, utility
-# from collections import defaultdict
-# import uuid
-
-# # Configure logging
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-# )
-# logger = logging.getLogger("corrected-milvus-router")
-
-# # Create FastAPI app
-# app = FastAPI(title="Corrected Milvus Router", version="2.0.1")
-
-# # Keep the exact same API models as your original router
-# class EmbeddingRequest(BaseModel):
-#     track_id: int
-#     embedding: List[float]
-#     store_id: int
-#     camera_id: int
-#     timestamp: int
-
-# class BatchEmbeddingRequest(BaseModel):
-#     track_ids: List[int]
-#     embeddings: List[List[float]]
-#     store_ids: List[int]
-#     camera_ids: List[int]
-#     timestamps: List[int]
-
-# class SearchRequest(BaseModel):
-#     embedding: List[float]
-#     store_id: int
-#     top_k: int = 5
-#     camera_filter: Optional[int] = None
-#     min_similarity: float = 0.0
-
-# class BatchSearchRequest(BaseModel):
-#     embeddings: List[List[float]]
-#     store_id: int
-#     top_k: int = 5
-#     min_similarity: float = 0.0
-
-# class DeleteRequest(BaseModel):
-#     track_id: int
-#     store_id: int
-
-# class ShardConfig(BaseModel):
-#     id: str
-#     host: str
-#     port: int
-#     replica_of: Optional[str] = None
-#     status: str = "active"
-
-# class TopologyResponse(BaseModel):
-#     shards: Dict[str, ShardConfig]
-#     store_mappings: Dict[str, str]
-
-# class CorrectedMilvusRouter:
-#     """Corrected router for optimized collection schema"""
-    
-#     def __init__(self, collection_name="person_reid_features", embedding_dim=768):
-#         self.collection_name = collection_name
-#         self.embedding_dim = embedding_dim
-#         self.shard_configs = {}
-#         self.store_to_shard = {}
-        
-#         # Load simple configuration
-#         self.milvus_host = os.environ.get("MILVUS_HOST", "74.235.98.141")
-#         self.milvus_port = int(os.environ.get("MILVUS_PORT", "19530"))
-        
-#         logger.debug(f"Corrected router configured for {self.milvus_host}:{self.milvus_port}")
-#         logger.debug(f"Collection: {self.collection_name}")
-    
-#     def _get_connection(self):
-#         """Get a simple connection - creates new one each time"""
-#         alias = f"conn_{uuid.uuid4().hex[:8]}"
-#         connections.connect(
-#             alias,
-#             host=self.milvus_host,
-#             port=self.milvus_port,
-#             timeout=30
-#         )
-#         return alias
-    
-#     def _cleanup_connection(self, alias):
-#         """Clean up connection"""
-#         try:
-#             connections.disconnect(alias)
-#         except:
-#             pass
-    
-#     async def _get_connection_for_store(self, store_id: int):
-#         """Mimic original API - just return connection and dummy shard_id"""
-#         alias = self._get_connection()
-#         return alias, "shard1"
-    
-#     def _create_store_camera_composite(self, store_id: int, camera_id: int) -> int:
-#         """Create composite key - FIXED to match the test script formula"""
-#         # Use the same formula as in the test scripts: store_id * 10000 + camera_id
-#         return store_id * 10000 + camera_id
-    
-#     def _validate_embedding(self, embedding: List[float]) -> List[float]:
-#         """Validate and normalize embedding"""
-#         if len(embedding) != self.embedding_dim:
-#             raise ValueError(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
-        
-#         # Ensure it's a list of floats
-#         return [float(x) for x in embedding]
-    
-#     def _prepare_insert_data(self, embeddings, track_ids, store_ids, camera_ids, timestamps):
-#         """Prepare data in the EXACT order required by the schema"""
-        
-#         # Validate all embeddings
-#         validated_embeddings = []
-#         for emb in embeddings:
-#             if isinstance(emb, np.ndarray):
-#                 validated_embeddings.append(emb.astype(np.float32).tolist())
-#             else:
-#                 validated_embeddings.append(self._validate_embedding(emb))
-        
-#         # Ensure proper data types for schema compatibility
-#         validated_track_ids = [int(x) for x in track_ids]
-#         validated_store_ids = [int(x) for x in store_ids]  # INT32 in schema
-#         validated_camera_ids = [int(x) for x in camera_ids]  # INT32 in schema
-#         validated_timestamps = [int(x) for x in timestamps]  # INT64 in schema
-        
-#         # Create composite keys
-#         store_camera_composites = [
-#             self._create_store_camera_composite(store_id, camera_id)
-#             for store_id, camera_id in zip(validated_store_ids, validated_camera_ids)
-#         ]
-        
-#         # CRITICAL: Data must be in EXACT schema field order
-#         # Schema order: id (auto), feature_vector, track_id, store_id, camera_id, timestamp, store_camera_composite
-#         data = [
-#             validated_embeddings,        # feature_vector (FLOAT_VECTOR, dim=768)
-#             validated_track_ids,         # track_id (INT64)
-#             validated_store_ids,         # store_id (INT32)
-#             validated_camera_ids,        # camera_id (INT32)
-#             validated_timestamps,        # timestamp (INT64)
-#             store_camera_composites      # store_camera_composite (INT64)
-#         ]
-        
-#         return data
-    
-#     async def insert_embedding(self, request: EmbeddingRequest):
-#         """Insert a single embedding - CORRECTED"""
-#         alias = None
-#         try:
-#             alias, shard_id = await self._get_connection_for_store(request.store_id)
-#             collection = Collection(self.collection_name, using=alias)
-            
-#             # Prepare data using corrected helper
-#             data = self._prepare_insert_data(
-#                 embeddings=[request.embedding],
-#                 track_ids=[request.track_id],
-#                 store_ids=[request.store_id],
-#                 camera_ids=[request.camera_id],
-#                 timestamps=[request.timestamp]
-#             )
-            
-#             logger.debug(f"Inserting single record: track_id={request.track_id}, store_id={request.store_id}")
-            
-#             # Insert without flush (as requested)
-#             result = collection.insert(data)
-            
-#             return {"success": True, "shard_id": shard_id}
-            
-#         except Exception as e:
-#             logger.error(f"Insert error: {e}")
-#             logger.error(f"Request data: track_id={request.track_id}, store_id={request.store_id}, embedding_dim={len(request.embedding)}")
-#             raise HTTPException(status_code=500, detail=f"Insert failed: {str(e)}")
-#         finally:
-#             if alias:
-#                 self._cleanup_connection(alias)
-    
-#     async def insert_embeddings_batch(self, request: BatchEmbeddingRequest):
-#         """Insert multiple embeddings - CORRECTED"""
-#         alias = None
-#         try:
-#             # Validate request data first
-#             if not all(len(lst) == len(request.track_ids) for lst in [
-#                 request.embeddings, request.store_ids, request.camera_ids, request.timestamps
-#             ]):
-#                 raise ValueError("All input lists must have the same length")
-            
-#             # Group by store_id like original
-#             store_groups = defaultdict(list)
-#             for i in range(len(request.track_ids)):
-#                 store_id = request.store_ids[i]
-#                 store_groups[store_id].append(i)
-            
-#             results = {}
-#             total_inserted = 0
-            
-#             for store_id, indices in store_groups.items():
-#                 alias, shard_id = await self._get_connection_for_store(store_id)
-                
-#                 try:
-#                     collection = Collection(self.collection_name, using=alias)
-                    
-#                     # Extract data for this store group
-#                     batch_embeddings = [request.embeddings[i] for i in indices]
-#                     batch_track_ids = [request.track_ids[i] for i in indices]
-#                     batch_store_ids = [request.store_ids[i] for i in indices]
-#                     batch_camera_ids = [request.camera_ids[i] for i in indices]
-#                     batch_timestamps = [request.timestamps[i] for i in indices]
-                    
-#                     # Prepare data using corrected helper
-#                     data = self._prepare_insert_data(
-#                         embeddings=batch_embeddings,
-#                         track_ids=batch_track_ids,
-#                         store_ids=batch_store_ids,
-#                         camera_ids=batch_camera_ids,
-#                         timestamps=batch_timestamps
-#                     )
-                    
-#                     logger.debug(f"Inserting batch for store {store_id}: {len(indices)} records")
-#                     logger.debug(f"First embedding dimension: {len(batch_embeddings[0]) if batch_embeddings else 0}")
-                    
-#                     # Insert without flush (as requested)
-#                     collection.insert(data)
-                    
-#                     results[store_id] = {
-#                         "shard_id": shard_id,
-#                         "insert_count": len(indices)
-#                     }
-#                     total_inserted += len(indices)
-                    
-#                 finally:
-#                     if alias:
-#                         self._cleanup_connection(alias)
-#                         alias = None  # Reset for next iteration
-            
-#             return {
-#                 "success": True,
-#                 "results": results,
-#                 "total_inserted": total_inserted
-#             }
-            
-#         except Exception as e:
-#             logger.error(f"Batch insert error: {e}")
-#             logger.error(f"Error type: {type(e).__name__}")
-#             # Add more debugging info
-#             logger.error(f"Request validation - track_ids: {len(request.track_ids) if hasattr(request, 'track_ids') else 'missing'}")
-#             logger.error(f"Request validation - embeddings: {len(request.embeddings) if hasattr(request, 'embeddings') else 'missing'}")
-#             logger.error(f"Request validation - store_ids: {len(request.store_ids) if hasattr(request, 'store_ids') else 'missing'}")
-#             raise HTTPException(status_code=500, detail=f"Batch insert failed: {str(e)}")
-#         finally:
-#             if alias:
-#                 self._cleanup_connection(alias)
-    
-#     async def search_embedding(self, request: SearchRequest):
-#         """Search for similar embeddings - CORRECTED"""
-#         alias = None
-#         try:
-#             alias, shard_id = await self._get_connection_for_store(request.store_id)
-#             collection = Collection(self.collection_name, using=alias)
-            
-#             # Validate embedding
-#             validated_embedding = self._validate_embedding(request.embedding)
-            
-#             # Optimized search parameters 
-#             search_params = {
-#                 "metric_type": "COSINE",
-#                 "params": {"ef": min(request.top_k * 4, 64)}  # Conservative ef
-#             }
-            
-#             # Build filter expression for new schema
-#             expr_parts = [f"store_id == {request.store_id}"]
-#             if request.camera_filter is not None:
-#                 expr_parts.append(f"camera_id == {request.camera_filter}")
-#             expr = " and ".join(expr_parts)
-            
-#             query_embedding = np.array([validated_embedding])
-            
-#             # Search using correct field name
-#             results = collection.search(
-#                 data=query_embedding,
-#                 anns_field="feature_vector",  # Correct field name
-#                 param=search_params,
-#                 limit=request.top_k,
-#                 expr=expr,
-#                 output_fields=["track_id", "store_id", "camera_id", "timestamp"],
-#                 consistency_level="Session"
-#             )
-            
-#             # Process results 
-#             matches = []
-#             for hit in results[0]:
-#                 similarity = 1.0 - hit.distance
-#                 if similarity >= request.min_similarity:
-#                     matches.append({
-#                         "track_id": hit.entity.get("track_id"),
-#                         "similarity": similarity,
-#                         "metadata": {
-#                             "store_id": hit.entity.get("store_id"),
-#                             "camera_id": hit.entity.get("camera_id"),
-#                             "timestamp": hit.entity.get("timestamp")
-#                         }
-#                     })
-            
-#             return {
-#                 "success": True,
-#                 "shard_id": shard_id,
-#                 "matches": matches,
-#                 "total_matches": len(matches)
-#             }
-            
-#         except Exception as e:
-#             logger.error(f"Search error: {e}")
-#             raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-#         finally:
-#             if alias:
-#                 self._cleanup_connection(alias)
-    
-#     async def search_embeddings_batch(self, request: BatchSearchRequest):
-#         """Batch search - CORRECTED"""
-#         alias = None
-#         try:
-#             alias, shard_id = await self._get_connection_for_store(request.store_id)
-#             collection = Collection(self.collection_name, using=alias)
-            
-#             # Validate all embeddings
-#             validated_embeddings = [self._validate_embedding(emb) for emb in request.embeddings]
-            
-#             # Optimized search parameters
-#             search_params = {
-#                 "metric_type": "COSINE", 
-#                 "params": {"ef": min(request.top_k * 4, 64)}
-#             }
-            
-#             expr = f"store_id == {request.store_id}"
-#             query_embeddings = np.array(validated_embeddings)
-            
-#             # Search using correct field name
-#             results = collection.search(
-#                 data=query_embeddings,
-#                 anns_field="feature_vector",  # Correct field name
-#                 param=search_params,
-#                 limit=request.top_k,
-#                 expr=expr,
-#                 output_fields=["track_id", "store_id", "camera_id", "timestamp"],
-#                 consistency_level="Session"
-#             )
-            
-#             # Process results for tracker compatibility
-#             batch_results = []
-#             for query_results in results:
-#                 query_matches = []
-#                 for hit in query_results:
-#                     similarity = 1.0 - hit.distance
-#                     if similarity >= request.min_similarity:
-#                         # Return (track_id, distance) format for tracker
-#                         query_matches.append((hit.entity.get("track_id"), hit.distance))
-#                 batch_results.append(query_matches)
-            
-#             return {
-#                 "success": True,
-#                 "shard_id": shard_id,
-#                 "results": batch_results
-#             }
-            
-#         except Exception as e:
-#             logger.error(f"Batch search error: {e}")
-#             raise HTTPException(status_code=500, detail=f"Batch search failed: {str(e)}")
-#         finally:
-#             if alias:
-#                 self._cleanup_connection(alias)
-    
-#     async def delete_track(self, request: DeleteRequest):
-#         """Delete a track - CORRECTED"""
-#         alias = None
-#         try:
-#             alias, shard_id = await self._get_connection_for_store(request.store_id)
-#             collection = Collection(self.collection_name, using=alias)
-            
-#             expr = f"track_id == {request.track_id} and store_id == {request.store_id}"
-#             collection.delete(expr)
-#             # No flush as requested
-            
-#             return {
-#                 "success": True,
-#                 "shard_id": shard_id,
-#                 "deleted": True
-#             }
-            
-#         except Exception as e:
-#             logger.error(f"Delete error: {e}")
-#             raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-#         finally:
-#             if alias:
-#                 self._cleanup_connection(alias)
-    
-#     async def get_features_by_track_id(self, track_id: int, store_id: int):
-#         """Get features for a track - CORRECTED"""
-#         alias = None
-#         try:
-#             alias, shard_id = await self._get_connection_for_store(store_id)
-#             collection = Collection(self.collection_name, using=alias)
-            
-#             expr = f"track_id == {track_id} && store_id == {store_id}"
-            
-#             # Query using correct field names
-#             results = collection.query(
-#                 expr=expr,
-#                 output_fields=["feature_vector", "timestamp", "camera_id"],
-#                 limit=1000,
-#                 consistency_level="Session"
-#             )
-            
-#             # Convert to original API format
-#             features = []
-#             for row in results:
-#                 features.append({
-#                     "embedding": row["feature_vector"],  # Map to original API name
-#                     "timestamp": row.get("timestamp"),
-#                     "camera_id": row.get("camera_id")
-#                 })
-            
-#             return {
-#                 "success": True,
-#                 "shard_id": shard_id,
-#                 "track_id": track_id,
-#                 "store_id": store_id,
-#                 "features": features,
-#                 "feature_count": len(features)
-#             }
-            
-#         except Exception as e:
-#             logger.error(f"Get features error: {e}")
-#             raise HTTPException(status_code=500, detail=f"Failed to get features: {str(e)}")
-#         finally:
-#             if alias:
-#                 self._cleanup_connection(alias)
-    
-#     async def get_all_track_features(self, store_id: int, limit: int = 100000):
-#         """Get all track features - CORRECTED"""
-#         alias = None
-#         try:
-#             alias, shard_id = await self._get_connection_for_store(store_id)
-#             collection = Collection(self.collection_name, using=alias)
-            
-#             expr = f"store_id == {store_id}"
-            
-#             # Query using correct field names
-#             results = collection.query(
-#                 expr=expr,
-#                 output_fields=["track_id", "feature_vector"],
-#                 limit=min(limit, 16384),  # Milvus limit
-#                 consistency_level="Session"
-#             )
-            
-#             # Group by track_id
-#             feature_map = defaultdict(list)
-#             for row in results:
-#                 track_id = row["track_id"]
-#                 embedding = np.array(row["feature_vector"], dtype=np.float32)
-#                 feature_map[track_id].append(embedding)
-            
-#             return {
-#                 "success": True,
-#                 "shard_id": shard_id,
-#                 "track_count": len(feature_map),
-#                 "features": dict(feature_map)
-#             }
-            
-#         except Exception as e:
-#             logger.error(f"Get all features error: {e}")
-#             raise HTTPException(status_code=500, detail=f"Failed to get track features: {str(e)}")
-#         finally:
-#             if alias:
-#                 self._cleanup_connection(alias)
-    
-#     async def get_topology(self):
-#         """Get topology - same API as original"""
-#         return TopologyResponse(
-#             shards={
-#                 "shard1": ShardConfig(
-#                     id="shard1",
-#                     host=self.milvus_host,
-#                     port=self.milvus_port,
-#                     status="active"
-#                 )
-#             },
-#             store_mappings=self.store_to_shard
-#         )
-
-# # Initialize corrected router
-# router = CorrectedMilvusRouter()
-
-# # Same startup and endpoints as original...
-# @app.on_event("startup")
-# async def startup():
-#     """Initialize router on application startup"""
-#     config_path = os.path.join(os.path.dirname(__file__), "config.json")
-#     if os.path.exists(config_path):
-#         try:
-#             with open(config_path, "r") as f:
-#                 config = json.load(f)
-#                 logger.debug(f"Loaded configuration from {config_path}")
-            
-#             # Load shard configs
-#             if "shards" in config:
-#                 for shard_id, shard_data in config["shards"].items():
-#                     shard_config = ShardConfig(**shard_data)
-#                     router.shard_configs[shard_id] = shard_config
-#                     router.milvus_host = shard_config.host
-#                     router.milvus_port = shard_config.port
-#                     logger.debug(f"Using shard {shard_id}: {shard_config.host}:{shard_config.port}")
-#                     break
-                
-#             # Load store mappings
-#             if "store_mappings" in config:
-#                 for store_id, shard_id in config["store_mappings"].items():
-#                     router.store_to_shard[store_id] = shard_id
-#                 logger.debug(f"Mapped {len(config['store_mappings'])} stores to shards")
-                
-#             logger.debug(f"Corrected router initialized successfully")
-#         except Exception as e:
-#             logger.error(f"Error loading configuration: {e}")
-#     else:
-#         logger.debug(f"No config file found, using defaults")
-
-# # All the same API endpoints...
-# @app.get("/health")
-# async def health_check():
-#     return JSONResponse(status_code=200, content={"status": "ok"})
-
-# @app.post("/insert")
-# async def insert_embedding(request: EmbeddingRequest):
-#     return await router.insert_embedding(request)
-
-# @app.post("/batch_insert")
-# async def insert_embeddings_batch(request: BatchEmbeddingRequest):
-#     return await router.insert_embeddings_batch(request)
-
-# @app.post("/search")
-# async def search_embedding(request: SearchRequest):
-#     return await router.search_embedding(request)
-
-# @app.post("/batch_search")
-# async def search_embeddings_batch(request: BatchSearchRequest):
-#     return await router.search_embeddings_batch(request)
-
-# @app.post("/delete")
-# async def delete_track(request: DeleteRequest):
-#     return await router.delete_track(request)
-
-# @app.get("/topology")
-# async def get_topology():
-#     return await router.get_topology()
-
-# @app.get("/features/{track_id}/{store_id}")
-# async def get_features(track_id: int, store_id: int):
-#     return await router.get_features_by_track_id(track_id, store_id)
-
-# @app.get("/track/features/{track_id}/{store_id}")
-# async def get_track_features_for_tracker(track_id: int, store_id: int):
-#     """Get features for tracker"""
-#     result = await router.get_features_by_track_id(track_id, store_id)
-#     features = [f["embedding"] for f in result["features"]]
-#     return {"track_id": track_id, "store_id": store_id, "features": features}
-
-# @app.post("/track/search")
-# async def search_for_tracker(request: SearchRequest):
-#     """Search for tracker"""
-#     result = await router.search_embedding(request)
-#     tracker_results = [
-#         (match["track_id"], 1.0 - match["similarity"])
-#         for match in result["matches"]
-#     ]
-#     return {"results": tracker_results}
-
-# @app.get("/track/allfeatures/{store_id}")
-# async def get_all_track_features_for_tracker(store_id: int, limit: int = 100000):
-#     """Get all features for tracker"""
-#     result = await router.get_all_track_features(store_id, limit)
-    
-#     tracker_features = {}
-#     for track_id, embeddings in result["features"].items():
-#         track_id_int = int(track_id)
-#         tracker_features[track_id_int] = [e.tolist() for e in embeddings]
-    
-#     return tracker_features
-
-# @app.get("/test_connection/{store_id}")
-# async def test_connection(store_id: int):
-#     """Test connection"""
-#     try:
-#         alias, shard_id = await router._get_connection_for_store(store_id)
-        
-#         try:
-#             collection_list = utility.list_collections(using=alias)
-            
-#             return {
-#                 "success": True,
-#                 "store_id": store_id,
-#                 "shard_id": shard_id,
-#                 "host": router.milvus_host,
-#                 "port": router.milvus_port,
-#                 "collections": collection_list
-#             }
-#         finally:
-#             router._cleanup_connection(alias)
-            
-#     except Exception as e:
-#         logger.error(f"Connection test failed: {e}")
-#         return {
-#             "success": False,
-#             "store_id": store_id,
-#             "error": str(e)
-#         }
-
-# @app.get("/performance/breakdown")
-# async def get_performance_breakdown():
-#     """Performance endpoint for compatibility"""
-#     return {
-#         "bottleneck_analysis": "healthy",
-#         "timing_breakdown": {
-#             "avg_total": 0.05,
-#             "avg_connection_wait": 0.01,
-#             "avg_database": 0.03,
-#             "avg_processing": 0.01,
-#             "slow_requests": 0
-#         },
-#         "connection_pool_health": {
-#             "avg_wait_time": 0.01,
-#             "max_wait_time": 0.02,
-#             "waiting_requests": {},
-#             "total_connections": 1
-#         },
-#         "diagnosis": {
-#             "router_overloaded": False,
-#             "database_slow": False,
-#             "many_slow_requests": False
-#         }
-#     }
-
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
-
 """
 Milvus Sharding Router - Routes requests to appropriate Milvus shards based on store_id.
 
@@ -1358,10 +696,13 @@ class ShardedMilvusRouter:
                 config_service_url=None, 
                 redis_url=None,
                 collection_name="person_reid_features",
-                embedding_dim=768):
+                embedding_dim=768,
+                max_connections_per_shard=64,
+                connection_timeout=10
+                ):
         self.embedding_dim = embedding_dim
         self.sharding_manager = ShardingManager(config_service_url, redis_url)
-        self.connection_pool = ConnectionPool()
+        self.connection_pool = ConnectionPool(max_connections_per_shard = max_connections_per_shard, connection_timeout= connection_timeout)
         self.collection_manager = MilvusCollectionManager(collection_name, embedding_dim)
         self.health_monitor = RouterHealthMonitor(self.sharding_manager, self.connection_pool)
 
@@ -1425,6 +766,15 @@ class ShardedMilvusRouter:
         connection_alias = await self.connection_pool.get_connection_alias(shard_id)
         
         return connection_alias, shard_id
+
+    def _validate_embedding(self, embedding: List[float]) -> List[float]:
+        """Validate and normalize embedding"""
+        if len(embedding) != self.embedding_dim:
+            raise ValueError(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
+        
+        # Ensure it's a list of floats
+        return [float(x) for x in embedding]
+
 
     def _prepare_insert_data(
         self,
@@ -1817,7 +1167,7 @@ class ShardedMilvusRouter:
         try:
             # Use existing search method but transform result format
             search_result = await self.search_embedding(SearchRequest(
-                embedding=query_embedding,
+                feature_vector=query_embedding,
                 store_id=store_id,
                 top_k=top_k,
                 min_similarity=0.0  # Return all results and let tracker filter
@@ -1978,7 +1328,7 @@ class ShardedMilvusRouter:
             features_result = await self.get_features_by_track_id(track_id, store_id)
             
             # Convert to list of numpy arrays as expected by tracker
-            embeddings = [np.array(f["embedding"], dtype=np.float32) for f in features_result["features"]]
+            embeddings = [np.array(f["feature_vector"], dtype=np.float32) for f in features_result["features"]]
             return embeddings
         except Exception as e:
             logger.error(f"Error getting features for track_id {track_id}: {e}")
@@ -2189,42 +1539,126 @@ class ShardedMilvusRouter:
             logger.error(f"Error fetching track_ids for store_id {store_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to get track IDs: {str(e)}")
 
+def load_config():
+    # Try multiple possible config paths (ordered by priority)
+    possible_paths = [
+        os.environ.get("CONFIG_PATH"),
+        "/app/config.json",         # Kubernetes mounted path from your deployment
+        "./config.json",            # Current directory (for local development)
+        "/etc/milvus-router/config.json",  # Alternative system config
+        os.path.join(os.path.dirname(__file__), "config.json")  # Same directory as script
+    ]
+    
+    config = {}
+    config_loaded = False
+    
+    for config_path in possible_paths:
+        if not config_path:
+            continue
+            
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    logger.info(f"Successfully loaded config from {config_path}")
+                    config_loaded = True
+                    break
+        except FileNotFoundError:
+            logger.debug(f"Config file not found at {config_path}")
+            continue
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in config file at {config_path}: {e}")
+            continue
+        except Exception as e:
+            logger.error(f"Error loading config from {config_path}: {e}")
+            continue
+    
+    if not config_loaded:
+        logger.warning("No config file found, using environment variables and defaults")
+    
+    return config
+
+config = load_config()
+
+# Extract router configuration values with multiple fallback strategies
+def get_config_value(key, default_value, config_dict=None):
+    """Get config value from multiple sources with fallbacks"""
+    if config_dict is None:
+        config_dict = config
+    
+    # Strategy 1: Direct key in config
+    if key in config_dict:
+        return config_dict[key]
+    
+    # Strategy 2: Environment variable
+    env_key = key.upper()
+    env_value = os.environ.get(env_key)
+    if env_value is not None:
+        try:
+            # Try to convert to appropriate type
+            if isinstance(default_value, int):
+                return int(env_value)
+            elif isinstance(default_value, float):
+                return float(env_value)
+            elif isinstance(default_value, bool):
+                return env_value.lower() in ('true', '1', 'yes', 'on')
+            else:
+                return env_value
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid value for {env_key}: {env_value}, using default")
+    
+    # Strategy 3: Default value
+    return default_value
+
+# Extract configuration values
+max_connections_per_shard = get_config_value("max_connections_per_shard", 64)
+connection_timeout = get_config_value("connection_timeout", 10)
+
+# Validate configuration values
+if max_connections_per_shard < 1 or max_connections_per_shard > 512:
+    logger.warning(f"Invalid max_connections_per_shard: {max_connections_per_shard}, using default 64")
+    max_connections_per_shard = 64
+
+if connection_timeout < 1 or connection_timeout > 60:
+    logger.warning(f"Invalid connection_timeout: {connection_timeout}, using default 10")
+    connection_timeout = 10
+
+logger.info(f"Router configuration: max_connections_per_shard={max_connections_per_shard}, connection_timeout={connection_timeout}")
 # Initialize router
 router = ShardedMilvusRouter(
     config_service_url=os.environ.get("CONFIG_SERVICE_URL"),
-    redis_url=os.environ.get("REDIS_URL")
+    redis_url=os.environ.get("REDIS_URL"),
+    max_connections_per_shard=max_connections_per_shard,
+    connection_timeout = connection_timeout
 )
 
 @app.on_event("startup")
 async def startup():
     """Initialize router on application startup"""
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r") as f:
-                config = json.load(f)
-                logger.debug(f"Loaded configuration from {config_path}")
-            # Initialize shards from config
-            if "shards" in config:
-                for shard_id, shard_data in config["shards"].items():
-                    shard_config = ShardConfig(**shard_data)
-                    router.sharding_manager.shard_configs[shard_id] = shard_config
-                    logger.debug(f"Added shard {shard_id}: {shard_config.host}:{shard_config.port}")
-                
-            # Initialize store-to-shard mappings
-            if "store_mappings" in config:
-                for store_id, shard_id in config["store_mappings"].items():
-                    router.sharding_manager.store_to_shard[store_id] = shard_id
-                logger.debug(f"Mapped {len(config['store_mappings'])} stores to shards")
-                
-             # Log the configuration
-            logger.debug(f"Router initialized with {len(router.sharding_manager.shard_configs)} shards and {len(router.sharding_manager.store_to_shard)} store mappings")
-        except Exception as e:
-            logger.error(f"Error loading configuration: {e}", exc_info=True)
-    else:
-        logger.debug(f"No config file found at {config_path}, using environment variables or defaults")
+    # Use the global config that was loaded at module level
+    global config
+    
+    try:
+        # Initialize shards from config
+        if "shards" in config:
+            for shard_id, shard_data in config["shards"].items():
+                shard_config = ShardConfig(**shard_data)
+                router.sharding_manager.shard_configs[shard_id] = shard_config
+                logger.info(f"Added shard {shard_id}: {shard_config.host}:{shard_config.port}")
+            
+        # Initialize store-to-shard mappings
+        if "store_mappings" in config:
+            for store_id, shard_id in config["store_mappings"].items():
+                router.sharding_manager.store_to_shard[store_id] = shard_id
+            logger.info(f"Mapped {len(config['store_mappings'])} stores to shards")
+            
+        # Log the configuration
+        logger.info(f"Router initialized with {len(router.sharding_manager.shard_configs)} shards and {len(router.sharding_manager.store_to_shard)} store mappings")
+        
+    except Exception as e:
+        logger.error(f"Error loading configuration during startup: {e}", exc_info=True)
+        
     await router.start()
-
 @app.on_event("shutdown")
 async def shutdown():
     """Cleanup router on application shutdown"""
