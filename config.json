@@ -1,14 +1,21 @@
 {
+  "collection_name": "person_reid_features",
+  "embedding_dim": 768,
+  "max_connections_per_shard": 10,
+  "connection_timeout": 30,
+  "health_check_interval": 30,
+  "topology_refresh_interval": 60,
   "shards": {
     "shard1": {
       "id": "shard1",
-      "host": "20.244.11.103",
+      "host": "74.235.98.141",
       "port": 19530,
       "status": "active"
     }
   },
   "store_mappings": {
     "1": "shard1",
-    "2": "shard1"
+    "2": "shard1",
+    "5": "shard1"
   }
 }
