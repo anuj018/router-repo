@@ -52,19 +52,19 @@ class AsyncMilvusRouterClient:
             self._search_semaphore = asyncio.Semaphore(8)      # Dedicated for searches
             self._batch_semaphore = asyncio.Semaphore(5)       # Dedicated for batch ops
             self._feature_semaphore = asyncio.Semaphore(6)     # Dedicated for feature retrieval
-            logger.debug(f"Semaphore enabled with max concurrent requests: {self._max_concurrent}")
+            logger.info(f"Semaphore enabled with max concurrent requests: {self._max_concurrent}")
         else:
             self._request_semaphore = None
             self._search_semaphore = None     # Dedicated for searches
             self._batch_semaphore = None       # Dedicated for batch ops
             self._feature_semaphore = None     # Dedicated for feature retrieval
-            logger.debug("Semaphore disabled - unlimited concurrent requests")
+            logger.info("Semaphore disabled - unlimited concurrent requests")
 
         if self.enable_rate_limiting:
             self._min_interval = float(os.environ.get("MILVUS_MIN_INTERVAL", "0.01"))
             self._last_request_time = 0
             self._min_request_interval = self._min_interval
-            logger.debug(f"Rate limiting enabled with min interval: {self._min_interval}s")
+            logger.info(f"Rate limiting enabled with min interval: {self._min_interval}s")
         else:
             self._min_interval = 0
             self._last_request_time = 0
@@ -74,8 +74,8 @@ class AsyncMilvusRouterClient:
         # Create the HTTP client during initialization
         self._http_client = None
         
-        logger.debug(f"Initialized AsyncMilvusRouterClient for store_id={self.store_id}, router={router_url}")
-        logger.debug(f"Rate limiting: {'enabled' if self.enable_rate_limiting else 'disabled'}, "
+        logger.info(f"Initialized AsyncMilvusRouterClient for store_id={self.store_id}, router={router_url}")
+        logger.info(f"Rate limiting: {'enabled' if self.enable_rate_limiting else 'disabled'}, "
                    f"Semaphore: {'enabled' if self.enable_semaphore else 'disabled'}")
 
     async def _rate_limited_request(self, operation):
@@ -400,13 +400,13 @@ class AsyncMilvusRouterClient:
                         logger.error(f"Search attempt {attempt+1}/{effective_max_retries} failed with status {response.status_code}: {response.text}")
                         if attempt < effective_max_retries - 1:
                             #asyncio.sleep(0.1)
-                            logger.info("will sleep here 0.1")
+                            logger.debug("will sleep here 0.1")
                             continue
 
                 except asyncio.TimeoutError:
                     if attempt < effective_max_retries - 1:
                         #asyncio.sleep(0.05)
-                        logger.info("will sleep here 0.05")
+                        logger.debug("will sleep here 0.05")
                         continue
 
                 except Exception as e:
@@ -414,7 +414,7 @@ class AsyncMilvusRouterClient:
                     # Retry with exponential backoff (use asyncio.sleep instead of time.sleep)
                     if attempt < effective_max_retries - 1:
                         #asyncio.sleep(0.05)
-                        logger.info("will sleep here 0.05")
+                        logger.debug("will sleep here 0.05")
                         continue
                     
             logger.error("All search attempts failed")
@@ -670,7 +670,7 @@ class AsyncMilvusRouterClient:
                     # Small delay between chunks
                     if i + chunk_size < len(embeddings_list):
                         #asyncio.sleep(0.02)  # 20ms between chunks
-                        logger.info("will sleep here 0.02")
+                        logger.debug("will sleep here 0.02")
                 return all_results
 
             processed_embeddings = []
@@ -724,11 +724,11 @@ class AsyncMilvusRouterClient:
                             break
                             
                 # Fallback to smart individual/micro-batch processing
-                logger.info(f"Batch search failed, using fallback for {len(embeddings_list)} items")
+                logger.debug(f"Batch search failed, using fallback for {len(embeddings_list)} items")
                 return await self._fallback_individual_searches(embeddings_list, top_k, effective_store_id)
                     
             except Exception as e:
-                logger.info(f"Batch search error: {e}, using fallback")
+                logger.debug(f"Batch search error: {e}, using fallback")
                 return await self._fallback_individual_searches(embeddings_list, top_k, effective_store_id)
         
         # Use rate limited or direct request based on configuration

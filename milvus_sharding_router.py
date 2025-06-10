@@ -30,14 +30,15 @@ import uuid
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format=f"%(asctime)s [%(levelname)s] Worker-{os.getpid()} %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler("milvus_router.log"),
+        logging.FileHandler(f"milvus_router_worker_{os.getpid()}.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger("milvus-router")
+logger.info(f"Worker process {os.getpid()} starting...")
 
 # Create FastAPI app
 app = FastAPI(title="Milvus Sharding Router", version="1.0.0")
@@ -362,19 +363,34 @@ class ShardingManager:
         else:
             self.redis_client = None
         
-        self.http_client = None
-        if config_service_url:
+        self._http_client = None
+        
+
+        # if config_service_url:
+        #     import httpx
+        #     self.http_client = httpx.AsyncClient(
+        #         timeout=10.0,
+        #         limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        #         headers={"User-Agent": "MilvusRouter/1.0"}
+        #     )
+    
+    @property 
+    def http_client(self):
+        """Lazy initialization of HTTP client"""
+        if self._http_client is None and self.config_service_url:
             import httpx
-            self.http_client = httpx.AsyncClient(
+            self._http_client = httpx.AsyncClient(
                 timeout=10.0,
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
                 headers={"User-Agent": "MilvusRouter/1.0"}
             )
-    
-    async def __del__(self):
-        """Cleanup resources when object is destroyed"""
-        if self.http_client:
-            await self.http_client.aclose()
+        return self._http_client
+
+    async def cleanup(self):
+        """Explicit cleanup method"""
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
         
     async def refresh_topology(self, force=False):
         """Refresh shard topology from configuration service or Redis"""
@@ -724,6 +740,7 @@ class ShardedMilvusRouter:
         """Stop the router services"""
         await self.health_monitor.stop_monitoring()
         await self.connection_pool.reset_connections()
+        await self.sharding_manager.cleanup()
         
     async def _background_maintenance(self):
         """Background task for maintenance operations"""
@@ -1625,44 +1642,59 @@ if connection_timeout < 1 or connection_timeout > 60:
 
 logger.info(f"Router configuration: max_connections_per_shard={max_connections_per_shard}, connection_timeout={connection_timeout}")
 # Initialize router
-router = ShardedMilvusRouter(
-    config_service_url=os.environ.get("CONFIG_SERVICE_URL"),
-    redis_url=os.environ.get("REDIS_URL"),
-    max_connections_per_shard=max_connections_per_shard,
-    connection_timeout = connection_timeout
-)
+# router = ShardedMilvusRouter(
+#     config_service_url=os.environ.get("CONFIG_SERVICE_URL"),
+#     redis_url=os.environ.get("REDIS_URL"),
+#     max_connections_per_shard=max_connections_per_shard,
+#     connection_timeout = connection_timeout
+# )
 
 @app.on_event("startup")
 async def startup():
     """Initialize router on application startup"""
     # Use the global config that was loaded at module level
     global config
+    global router
     
     try:
+        router = ShardedMilvusRouter(
+            config_service_url=os.environ.get("CONFIG_SERVICE_URL"),
+            redis_url=os.environ.get("REDIS_URL"),
+            max_connections_per_shard=max_connections_per_shard,
+            connection_timeout=connection_timeout
+        )
+        app.state.router = router
         # Initialize shards from config
         if "shards" in config:
             for shard_id, shard_data in config["shards"].items():
                 shard_config = ShardConfig(**shard_data)
-                router.sharding_manager.shard_configs[shard_id] = shard_config
-                logger.info(f"Added shard {shard_id}: {shard_config.host}:{shard_config.port}")
+                app.state.router.sharding_manager.shard_configs[shard_id] = shard_config
+                logger.info(f"Worker {os.getpid()}: Added shard {shard_id}")
+                # logger.info(f"Added shard {shard_id}: {shard_config.host}:{shard_config.port}")
             
         # Initialize store-to-shard mappings
         if "store_mappings" in config:
             for store_id, shard_id in config["store_mappings"].items():
-                router.sharding_manager.store_to_shard[store_id] = shard_id
-            logger.info(f"Mapped {len(config['store_mappings'])} stores to shards")
-            
-        # Log the configuration
-        logger.info(f"Router initialized with {len(router.sharding_manager.shard_configs)} shards and {len(router.sharding_manager.store_to_shard)} store mappings")
-        
+                app.state.router.sharding_manager.store_to_shard[store_id] = shard_id
+            logger.info(f"Worker {os.getpid()}: Mapped {len(config['store_mappings'])} stores")
+            # logger.info(f"Mapped {len(config['store_mappings'])} stores to shards")
+                    
+        await app.state.router.start()
+        logger.info(f"Worker {os.getpid()}: Router initialized successfully")
+
     except Exception as e:
-        logger.error(f"Error loading configuration during startup: {e}", exc_info=True)
-        
-    await router.start()
+        logger.error(f"Worker {os.getpid()}: Error during startup: {e}", exc_info=True)
+        raise
+
 @app.on_event("shutdown")
 async def shutdown():
     """Cleanup router on application shutdown"""
-    await router.stop()
+    try:
+        if hasattr(app.state, 'router'):
+            await app.state.router.stop()
+            logger.info(f"Worker {os.getpid()}: Router stopped successfully")
+    except Exception as e:
+        logger.error(f"Worker {os.getpid()}: Error during shutdown: {e}")
 
 @app.get("/health")
 async def health_check():
@@ -1676,7 +1708,7 @@ async def health_check():
 async def configure_connection_pool(request: ConnectionPoolConfigRequest):
     """Configure connection pool settings dynamically"""
     try:
-        result = await router.configure_connection_pool(
+        result = await app.state.router.configure_connection_pool(
             max_connections=request.max_connections_per_shard,
             timeout=request.connection_timeout
         )
@@ -1699,46 +1731,46 @@ async def configure_connection_pool(request: ConnectionPoolConfigRequest):
 async def get_connection_pool_config():
     """Get current connection pool configuration"""
     return {
-        "max_connections_per_shard": router.connection_pool.max_connections_per_shard,
-        "connection_timeout": router.connection_pool.connection_timeout,
+        "max_connections_per_shard": app.state.router.connection_pool.max_connections_per_shard,
+        "connection_timeout": app.state.router.connection_pool.connection_timeout,
         "current_connections": {
             shard_id: len(conns) 
-            for shard_id, conns in router.connection_pool.connections.items()
+            for shard_id, conns in app.state.router.connection_pool.connections.items()
         },
-        "pool_health": router.connection_pool.get_pool_health()
+        "pool_health": app.state.router.connection_pool.get_pool_health()
     }
 
 # API Endpoints
 @app.post("/insert")
 async def insert_embedding(request: EmbeddingRequest):
     """Insert a single embedding"""
-    return await router.insert_embedding(request)
+    return await app.state.router.insert_embedding(request)
 
 @app.post("/batch_insert")
 async def insert_embeddings_batch(request: BatchEmbeddingRequest):
     """Insert multiple embeddings in a batch"""
-    return await router.insert_embeddings_batch(request)
+    return await app.state.router.insert_embeddings_batch(request)
 
 @app.post("/search")
 async def search_embedding(request: SearchRequest):
     """Search for similar embeddings"""
-    return await router.search_embedding(request)
+    return await app.state.router.search_embedding(request)
 
 # Add this API endpoint at the bottom with other endpoints
 @app.post("/batch_search")
 async def search_embeddings_batch(request: BatchSearchRequest):
     """Search for multiple embeddings in a single batch"""
-    return await router.search_embeddings_batch(request)
+    return await app.state.router.search_embeddings_batch(request)
 
 @app.post("/delete")
 async def delete_track(request: DeleteRequest):
     """Delete a track from the database"""
-    return await router.delete_track(request)
+    return await app.state.router.delete_track(request)
 
 @app.get("/topology")
 async def get_topology():
     """Get the current sharding topology"""
-    return await router.get_topology()
+    return await app.state.router.get_topology()
 
 # Add this to your milvus_sharding_router.py
 
@@ -1749,10 +1781,10 @@ async def test_connection(store_id: int):
         # Get connection details
         logger.debug(f"[{store_id}] start health check")
         t0 = time.time()
-        connection_alias, shard_id = await router._get_connection_for_store(store_id)
+        connection_alias, shard_id = await app.state.router._get_connection_for_store(store_id)
         t1 = time.time()
         logger.debug(f"[{store_id}] got alias in {t1 - t0:.3f}s")
-        shard_config = router.connection_pool.shard_info[shard_id]
+        shard_config = app.state.router.connection_pool.shard_info[shard_id]
         
         # Try to list collections as a test
         t2 = time.time()
@@ -1781,18 +1813,18 @@ async def test_connection(store_id: int):
 async def get_features(track_id: int, store_id: int):
     """Get all features for a specific track_id"""
     # return await router.get_features_by_track_id(track)
-    return await router.get_features_by_track_id(track_id, store_id)
+    return await app.state.router.get_features_by_track_id(track_id, store_id)
 
 @app.get("/track/features/{track_id}/{store_id}")
 async def get_track_features_for_tracker(track_id: int, store_id: int):
     """Get features for a specific track_id in tracker-compatible format"""
-    features = await router.get_features_by_track_id_for_tracker(track_id, store_id)
+    features = await app.state.router.get_features_by_track_id_for_tracker(track_id, store_id)
     return {"track_id": track_id, "store_id": store_id, "features": [f.tolist() for f in features]}
 
 @app.post("/track/search")
 async def search_for_tracker(request: SearchRequest):
     """Search for similar embeddings in tracker-compatible format"""
-    results = await router.search_embedding_for_tracker(
+    results = await app.state.router.search_embedding_for_tracker(
         query_embedding=request.feature_vector,
         store_id=request.store_id,
         top_k=request.top_k
@@ -1803,8 +1835,8 @@ async def search_for_tracker(request: SearchRequest):
 @app.get("/performance/breakdown")
 async def get_performance_breakdown():
    """Get detailed performance breakdown"""
-   timing_stats = router.timing_monitor.get_recent_stats()
-   pool_health = router.connection_pool.get_pool_health()
+   timing_stats = app.state.router.timing_monitor.get_recent_stats()
+   pool_health = app.state.router.connection_pool.get_pool_health()
    
    # Determine bottleneck
    bottleneck = "unknown"
@@ -1831,7 +1863,7 @@ async def get_performance_breakdown():
 @app.get("/track/allfeatures/{store_id}")
 async def get_all_track_features_for_tracker(store_id: int, limit: int = 100000):
     """Get all track features in tracker-compatible format"""
-    features = await router.get_all_track_features_for_tracker(store_id, limit)
+    features = await app.state.router.get_all_track_features_for_tracker(store_id, limit)
     # Convert numpy arrays to lists for JSON serialization
     result = {}
     for track_id, embeddings in features.items():

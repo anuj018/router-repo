@@ -1,9 +1,9 @@
 {
   "collection_name": "person_reid_features",
   "embedding_dim": 768,
-  "max_connections_per_shard": 10,
-  "connection_timeout": 30,
-  "health_check_interval": 30,
+  "max_connections_per_shard": 50,
+  "connection_timeout": 10,
+  "health_check_interval": 10,
   "topology_refresh_interval": 60,
   "shards": {
     "shard1": {
