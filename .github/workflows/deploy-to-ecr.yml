@@ -1,0 +1,86 @@
+name: Build and Push Milvus Router to ECR
+
+on:
+  push:
+    branches:
+      - main
+      - feature/paris-deployment
+      - develop
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  build-and-push:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Determine which AWS account to use based on branch
+      - name: Set deployment target
+        id: deployment-target
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/feature/paris-deployment" ]]; then
+            echo "aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID_PARIS }}" >> $GITHUB_OUTPUT
+            echo "aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY_PARIS }}" >> $GITHUB_OUTPUT
+            echo "aws_region=${{ secrets.AWS_REGION_PARIS }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ECR_REGISTRY_PARIS }}" >> $GITHUB_OUTPUT
+            echo "ecr_repository=${{ secrets.ECR_REPOSITORY_PARIS }}" >> $GITHUB_OUTPUT
+            echo "deployment_target=paris" >> $GITHUB_OUTPUT
+          else
+            echo "aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_OUTPUT
+            echo "aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_OUTPUT
+            echo "aws_region=${{ secrets.AWS_REGION }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ECR_REGISTRY }}" >> $GITHUB_OUTPUT
+            echo "ecr_repository=milvus-router" >> $GITHUB_OUTPUT
+            echo "deployment_target=us-east" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ steps.deployment-target.outputs.aws_access_key_id }}
+          aws-secret-access-key: ${{ steps.deployment-target.outputs.aws_secret_access_key }}
+          aws-region: ${{ steps.deployment-target.outputs.aws_region }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          driver: docker-container
+
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "timestamp=$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+      - name: Build and push Milvus Router
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile.router
+          push: true
+          tags: |
+            ${{ steps.deployment-target.outputs.ecr_registry }}/${{ steps.deployment-target.outputs.ecr_repository }}:latest
+            ${{ steps.deployment-target.outputs.ecr_registry }}/${{ steps.deployment-target.outputs.ecr_repository }}:${{ steps.timestamp.outputs.timestamp }}
+            ${{ steps.deployment-target.outputs.ecr_registry }}/${{ steps.deployment-target.outputs.ecr_repository }}:${{ github.sha }}
+          cache-from: type=inline
+          cache-to: type=inline
+
+      - name: Verify image in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name ${{ steps.deployment-target.outputs.ecr_repository }} \
+            --region ${{ steps.deployment-target.outputs.aws_region }} \
+            --image-ids imageTag=latest \
+            --query 'imageDetails[0].{ImageDigest:imageDigest,ImageSizeInBytes:imageSizeInBytes,ImagePushedAt:imagePushedAt}'
+
+      - name: Deployment summary
+        run: |
+          echo "🚀 Successfully deployed Milvus Router to: ${{ steps.deployment-target.outputs.deployment_target }}"
+          echo "📦 Latest: ${{ steps.deployment-target.outputs.ecr_registry }}/${{ steps.deployment-target.outputs.ecr_repository }}:latest"
+          echo "📦 Timestamp: ${{ steps.deployment-target.outputs.ecr_registry }}/${{ steps.deployment-target.outputs.ecr_repository }}:${{ steps.timestamp.outputs.timestamp }}"
+          echo "📦 SHA: ${{ steps.deployment-target.outputs.ecr_registry }}/${{ steps.deployment-target.outputs.ecr_repository }}:${{ github.sha }}"
