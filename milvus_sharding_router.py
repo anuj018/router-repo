@@ -762,6 +762,8 @@ class RouterHealthMonitor:
     async def _check_shard_health(self, shard_id: str, config: ShardConfig) -> bool:
         """Check health of a specific shard using a temporary connection"""
         temp_alias = f"temp_health_{shard_id}"
+        is_healthy = False  # Initialize the variable
+        
         try:
             # Create a temporary connection with a short timeout
             connections.connect(
@@ -779,18 +781,17 @@ class RouterHealthMonitor:
             # Immediately disconnect the temporary connection
             connections.disconnect(temp_alias)
             logger.debug(f"Temp health connection '{temp_alias}' disconnected for shard {shard_id}")
-
-            if hasattr(self, 'router_metrics') and self.router_metrics:
-                self.router_metrics.update_shard_health(shard_id, is_healthy)
-
-            return True
+            is_healthy = True  # Set to True on success
+            
         except Exception as e:
             logger.error(f"Health check failed for shard {shard_id} with alias {temp_alias}: {e}")
             try:
                 connections.disconnect(temp_alias)
             except Exception:
                 pass
-            return False
+            is_healthy = False  # Set to False on error
+            
+        return is_healthy
 
             
     async def is_shard_healthy(self, shard_id: str) -> bool:
