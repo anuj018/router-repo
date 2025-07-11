@@ -27,6 +27,111 @@ import uvicorn
 from collections import defaultdict, deque
 import uuid
 
+# Add these imports at the top
+from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
+from fastapi import Response
+import uuid
+from functools import wraps
+
+class MetricsCollector:
+    def __init__(self):
+        # Router Performance Metrics
+        self.request_count = Counter(
+            'router_requests_total', 
+            'Total requests processed', 
+            ['operation', 'status']
+        )
+        
+        self.request_duration = Histogram(
+            'router_request_duration_seconds',
+            'Request processing duration',
+            ['operation'],
+            buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0]
+        )
+        
+        self.connection_wait_time = Histogram(
+            'router_connection_wait_seconds',
+            'Time waiting for connection',
+            buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
+        )
+        
+        # Health & Status Metrics
+        self.router_uptime = Gauge(
+            'router_uptime_seconds',
+            'Router uptime in seconds'
+        )
+        
+        self.active_connections = Gauge(
+            'router_connections_active_total',
+            'Currently active connections across all shards'
+        )
+        
+        self.shard_health = Gauge(
+            'router_shard_health',
+            'Shard health status (1=healthy, 0=unhealthy)',
+            ['shard_id']
+        )
+        
+        self.router_info = Info(
+            'router_info',
+            'Router configuration information'
+        )
+        
+        # Track startup time for uptime calculation
+        self.startup_time = time.time()
+
+    def record_request(self, operation: str, status: str, duration: float):
+        """Record a completed request"""
+        self.request_count.labels(operation=operation, status=status).inc()
+        self.request_duration.labels(operation=operation).observe(duration)
+
+    def record_connection_wait(self, wait_time: float):
+        """Record connection wait time"""
+        self.connection_wait_time.observe(wait_time)
+
+    def update_uptime(self):
+        """Update router uptime"""
+        uptime = time.time() - self.startup_time
+        self.router_uptime.set(uptime)
+
+    def update_active_connections(self, count: int):
+        """Update total active connections"""
+        self.active_connections.set(count)
+
+    def update_shard_health(self, shard_id: str, is_healthy: bool):
+        """Update shard health status"""
+        self.shard_health.labels(shard_id=shard_id).set(1 if is_healthy else 0)
+
+    def set_router_info(self, **info):
+        """Set router configuration info"""
+        self.router_info.info(info)
+
+# Simple decorator for tracking operations
+def track_operation(operation_name: str):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            start_time = time.time()
+            
+            try:
+                result = await func(self, *args, **kwargs)
+                duration = time.time() - start_time
+                
+                # Record success
+                if hasattr(self, 'metrics'):
+                    self.metrics.record_request(operation_name, 'success', duration)
+                
+                return result
+                
+            except Exception as e:
+                duration = time.time() - start_time
+                if hasattr(self, 'metrics'):
+                    self.metrics.record_request(operation_name, 'error', duration)
+                raise
+                
+        return wrapper
+    return decorator
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -192,6 +297,10 @@ class ConnectionPool:
 
     async def get_connection_alias(self, shard_id: str) -> str:
         wait_start = time.time()
+
+        if hasattr(self, 'router_metrics') and self.router_metrics:
+            self.router_metrics.record_connection_wait(wait_time)
+
         self.waiting_requests[shard_id] += 1
 
         try:
@@ -202,7 +311,7 @@ class ConnectionPool:
 
                 # Log long waits
                 if wait_time > 1.0:
-                    logger.debug(f"LONG CONNECTION WAIT: {wait_time:.2f}s for shard {shard_id}, "
+                    logger.error(f"LONG CONNECTION WAIT: {wait_time:.2f}s for shard {shard_id}, "
                           f"waiting: {self.waiting_requests[shard_id]}, "
                           f"active: {len(self.connections.get(shard_id, {}))}")
 
@@ -670,6 +779,10 @@ class RouterHealthMonitor:
             # Immediately disconnect the temporary connection
             connections.disconnect(temp_alias)
             logger.debug(f"Temp health connection '{temp_alias}' disconnected for shard {shard_id}")
+
+            if hasattr(self, 'router_metrics') and self.router_metrics:
+                self.router_metrics.update_shard_health(shard_id, is_healthy)
+
             return True
         except Exception as e:
             logger.error(f"Health check failed for shard {shard_id} with alias {temp_alias}: {e}")
@@ -724,7 +837,16 @@ class ShardedMilvusRouter:
 
         #DEBUG
         self.timing_monitor = SimpleTimingMonitor()
-        
+        self.metrics = MetricsCollector()
+
+        # Set router info
+        self.metrics.set_router_info(
+            version="1.0.0",
+            embedding_dim=str(embedding_dim),
+            max_connections_per_shard=str(max_connections_per_shard),
+            connection_timeout=str(connection_timeout)
+        )
+
     async def start(self):
         """Start the router services"""
         # Start health monitoring
@@ -841,6 +963,7 @@ class ShardedMilvusRouter:
         # Use the same formula as in the test scripts: store_id * 10000 + camera_id
         return store_id * 10000 + camera_id
         
+    @track_operation("insert_embedding")
     async def insert_embedding(self, request: EmbeddingRequest):
         """Insert a single embedding"""
         try:
@@ -883,6 +1006,7 @@ class ShardedMilvusRouter:
             logger.error(f"Insert error: {e}")
             raise HTTPException(status_code=500, detail=f"Insert failed: {str(e)}")
             
+    @track_operation("insert_batch")
     async def insert_embeddings_batch(self, request: BatchEmbeddingRequest):
         """Insert multiple embeddings in a batch"""
         request_id = str(uuid.uuid4())[:8]
@@ -995,6 +1119,7 @@ class ShardedMilvusRouter:
             logger.error(f"Batch insert error: {e}")
             raise HTTPException(status_code=500, detail=f"Batch insert failed: {str(e)}")
             
+    @track_operation("search_embedding")
     async def search_embedding(self, request: SearchRequest):
         """Search for similar embeddings"""
         request_id = str(uuid.uuid4())[:8]
@@ -1085,6 +1210,7 @@ class ShardedMilvusRouter:
             raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
     # Add this method to the ShardedMilvusRouter class
+    @track_operation("batch_search")
     async def search_embeddings_batch(self, request: BatchSearchRequest):
         """Search for similar embeddings in batch"""
         request_id = str(uuid.uuid4())[:8]
@@ -1243,6 +1369,7 @@ class ShardedMilvusRouter:
             logger.error(f"Error finding next best match: {e}")
             return None, float('inf')
          
+    @track_operation("delete_track")
     async def delete_track(self, request: DeleteRequest):
         """Delete a track from the database"""
         try:
@@ -1680,8 +1807,10 @@ async def startup():
             # logger.info(f"Mapped {len(config['store_mappings'])} stores to shards")
                     
         await app.state.router.start()
-        logger.info(f"Worker {os.getpid()}: Router initialized successfully")
 
+        app.state.router.connection_pool.router_metrics = app.state.router.metrics
+        app.state.router.health_monitor.router_metrics = app.state.router.metrics
+        logger.info(f"Worker {os.getpid()}: Router initialized with metrics")
     except Exception as e:
         logger.error(f"Worker {os.getpid()}: Error during startup: {e}", exc_info=True)
         raise
@@ -1702,6 +1831,24 @@ async def health_check():
     A simple liveness probe for your router.
     """
     return JSONResponse(status_code=200, content={"status": "ok"})
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    # Update uptime before serving metrics
+    if hasattr(app.state, 'router') and app.state.router:
+        app.state.router.metrics.update_uptime()
+        
+        # Update active connections count
+        total_connections = sum(
+            len(conns) for conns in app.state.router.connection_pool.connections.values()
+        )
+        app.state.router.metrics.update_active_connections(total_connections)
+    
+    return Response(
+        generate_latest(), 
+        media_type=CONTENT_TYPE_LATEST
+    )
 
 # Add this endpoint with your other endpoints
 @app.post("/configure/connection_pool")
