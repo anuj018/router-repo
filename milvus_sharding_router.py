@@ -297,25 +297,29 @@ class ConnectionPool:
 
     async def get_connection_alias(self, shard_id: str) -> str:
         wait_start = time.time()
-
-        if hasattr(self, 'router_metrics') and self.router_metrics:
-            self.router_metrics.record_connection_wait(wait_time)
-
         self.waiting_requests[shard_id] += 1
-
         try:
             async with self.lock:
                 connection_alias = await self._get_connection_impl(shard_id)
-                wait_time = time.time() - wait_start
-                self.wait_times.append(wait_time)
+            wait_time = time.time() - wait_start
+            if hasattr(self, 'router_metrics') and self.router_metrics:
+                self.router_metrics.record_connection_wait(wait_time)
 
-                # Log long waits
-                if wait_time > 1.0:
-                    logger.error(f"LONG CONNECTION WAIT: {wait_time:.2f}s for shard {shard_id}, "
-                          f"waiting: {self.waiting_requests[shard_id]}, "
-                          f"active: {len(self.connections.get(shard_id, {}))}")
+            self.wait_times.append(wait_time)
 
-                return connection_alias
+            # Log long waits
+            if wait_time > 1.0:
+                logger.error(f"LONG CONNECTION WAIT: {wait_time:.2f}s for shard {shard_id}, "
+                        f"waiting: {self.waiting_requests[shard_id]}, "
+                        f"active: {len(self.connections.get(shard_id, {}))}")
+
+            return connection_alias
+        except Exception as e:
+            # Calculate wait_time for error cases too
+            wait_time = time.time() - wait_start
+            self.wait_times.append(wait_time)
+            logger.error(f"Connection error after {wait_time:.2f}s for shard {shard_id}: {e}")
+            raise      
         finally:
             self.waiting_requests[shard_id] -= 1
 
